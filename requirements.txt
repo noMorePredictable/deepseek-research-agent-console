@@ -1,0 +1,6 @@
+# AgentScope 版本与用户提供的 2.0.8 文档保持一致。
+agentscope==2.0.8
+beautifulsoup4>=4.12,<5
+ddgs>=9,<10
+httpx>=0.27,<1
+openai>=1.0,<4
