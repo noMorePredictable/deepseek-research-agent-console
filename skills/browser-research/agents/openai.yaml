@@ -1,0 +1,4 @@
+interface:
+  display_name: "Browser Research"
+  short_description: "Browse and verify web information through Playwright MCP"
+  default_prompt: "Use the browser-research skill to inspect a web page and report verified findings."

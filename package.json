@@ -1,0 +1,7 @@
+{
+  "name": "deepseek-research-agent-mcp",
+  "private": true,
+  "devDependencies": {
+    "@playwright/mcp": "0.0.83"
+  }
+}
