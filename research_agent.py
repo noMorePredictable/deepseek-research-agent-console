@@ -25,7 +25,9 @@ import httpx
 from agentscope.agent import Agent, ReActConfig
 from agentscope.console import launch_console
 from agentscope.credential import OpenAICredential
-from agentscope.model import OpenAIChatModel
+from agentscope.model import ChatModelBase, OpenAIChatModel
+from agentscope.permission import PermissionContext, PermissionMode
+from agentscope.state import AgentState
 from agentscope.tool import FunctionTool, Toolkit
 from bs4 import BeautifulSoup
 from ddgs import DDGS
@@ -126,12 +128,13 @@ TOOL_DEFINITIONS = [
 
 
 class ResearchAgent:
-    def __init__(self) -> None:
-        if not DEEPSEEK_API_KEY.strip():
+    def __init__(self, api_key: str | None = None) -> None:
+        resolved_api_key = DEEPSEEK_API_KEY if api_key is None else api_key
+        if not resolved_api_key.strip():
             raise ValueError("请先设置环境变量 DEEPSEEK_API_KEY")
 
         self.client = OpenAI(
-            api_key=DEEPSEEK_API_KEY,
+            api_key=resolved_api_key,
             base_url=DEEPSEEK_BASE_URL,
         )
         self.sources: dict[str, dict[str, str]] = {}
@@ -289,7 +292,7 @@ class ResearchAgent:
                 tools=TOOL_DEFINITIONS,
                 tool_choice="auto",
                 stream=False,
-                extra_body={"thinking": {"type": "disabled"}},
+                extra_body={"thinking": {"type": "enabled"}},
             )
             message = response.choices[0].message
             calls = message.tool_calls or []
@@ -335,7 +338,7 @@ class ResearchAgent:
                 model=DEEPSEEK_MODEL,
                 messages=messages,
                 stream=False,
-                extra_body={"thinking": {"type": "disabled"}},
+                extra_body={"thinking": {"type": "enabled"}},
             )
             final_text = response.choices[0].message.content or "没有生成报告。"
 
@@ -361,9 +364,16 @@ def _as_agentscope_tool(agent: ResearchAgent, definition: dict) -> FunctionTool:
     )
 
 
-def build_console_agent() -> Agent:
-    """复用现有 ResearchAgent 的四个工具，构建终端交互 Agent。"""
-    research_agent = ResearchAgent()
+def build_console_agent(
+    *,
+    extra_tools: list[FunctionTool] | None = None,
+    model: ChatModelBase | None = None,
+    system_prompt_suffix: str = "",
+    bypass_permissions: bool = False,
+    api_key: str | None = None,
+) -> Agent:
+    """复用现有 ResearchAgent 工具，并允许追加协作 Agent 工具。"""
+    research_agent = ResearchAgent(api_key=api_key)
     tools = [
         _as_agentscope_tool(research_agent, definition)
         for definition in TOOL_DEFINITIONS
@@ -377,25 +387,37 @@ def build_console_agent() -> Agent:
             is_read_only=True,
         )
     )
+    tools.extend(extra_tools or [])
 
-    model = OpenAIChatModel(
-        credential=OpenAICredential(
-            api_key=DEEPSEEK_API_KEY,
-            base_url=DEEPSEEK_BASE_URL,
-        ),
-        model=DEEPSEEK_MODEL,
-        parameters=OpenAIChatModel.Parameters(thinking_enable=False),
-        stream=True,
-        extra_body={"thinking": {"type": "disabled"}},
-    )
+    if model is None:
+        resolved_api_key = DEEPSEEK_API_KEY if api_key is None else api_key
+        model = OpenAIChatModel(
+            credential=OpenAICredential(
+                api_key=resolved_api_key,
+                base_url=DEEPSEEK_BASE_URL,
+            ),
+            model=DEEPSEEK_MODEL,
+            parameters=OpenAIChatModel.Parameters(thinking_enable=True),
+            stream=True,
+            extra_body={"thinking": {"type": "enabled"}},
+        )
+
+    state = None
+    if bypass_permissions:
+        state = AgentState(
+            permission_context=PermissionContext(mode=PermissionMode.BYPASS),
+        )
+
     return Agent(
         name="Researcher",
         system_prompt=(
             SYSTEM_PROMPT
             + "\n8. 在最终报告末尾调用 list_sources 核对并列出来源链接。"
+            + system_prompt_suffix
         ),
         model=model,
         toolkit=Toolkit(tools=tools),
+        state=state,
         react_config=ReActConfig(max_iters=MAX_TOOL_ROUNDS),
     )
 
@@ -429,4 +451,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-/*写的真是拉胯呀*/
+#写的真是拉胯呀

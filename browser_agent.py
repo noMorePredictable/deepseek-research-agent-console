@@ -104,9 +104,9 @@ def _deepseek_model() -> OpenAIChatModel:
             base_url=DEEPSEEK_BASE_URL,
         ),
         model=DEEPSEEK_MODEL,
-        parameters=OpenAIChatModel.Parameters(thinking_enable=False),
+        parameters=OpenAIChatModel.Parameters(thinking_enable=True),
         stream=True,
-        extra_body={"thinking": {"type": "disabled"}},
+        extra_body={"thinking": {"type": "enabled"}},
     )
 
 
