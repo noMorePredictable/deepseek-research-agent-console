@@ -33,6 +33,11 @@ PLAYWRIGHT_MCP_ENTRY = (
     PROJECT_ROOT / "node_modules" / "@playwright" / "mcp" / "cli.js"
 )
 SKILL_DIR = PROJECT_ROOT / "skills" / "browser-research"
+SANDBOX_IMAGE = os.getenv(
+    "BROWSER_SANDBOX_IMAGE",
+    "deepseek-research-agent-sandbox:latest",
+)
+SANDBOX_MCP_ENTRY = "/opt/playwright-mcp/node_modules/@playwright/mcp/cli.js"
 
 DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-flash")
@@ -115,6 +120,7 @@ def build_browser_agent(
     *,
     model: ChatModelBase | None = None,
     bypass_permissions: bool = False,
+    skills_or_loaders: list | None = None,
 ) -> Agent:
     """Build an AgentScope agent with the connected MCP and local Skill."""
     state = None
@@ -129,7 +135,7 @@ def build_browser_agent(
         model=model or _deepseek_model(),
         toolkit=Toolkit(
             mcps=[mcp_client],
-            skills_or_loaders=[str(SKILL_DIR)],
+            skills_or_loaders=skills_or_loaders or [str(SKILL_DIR)],
         ),
         state=state,
         react_config=ReActConfig(max_iters=15),
@@ -153,6 +159,67 @@ async def browser_agent_session(
         )
     finally:
         await client.close()
+
+
+def _sandbox_playwright_mcp() -> MCPClient:
+    """Describe the Playwright MCP process that runs inside Docker."""
+    return MCPClient(
+        name="playwright",
+        is_stateful=True,
+        mcp_config=StdioMCPConfig(
+            command="node",
+            args=[
+                SANDBOX_MCP_ENTRY,
+                "--browser=chromium",
+                "--headless",
+                "--isolated",
+                "--no-sandbox",
+            ],
+            env={"PLAYWRIGHT_BROWSERS_PATH": "/ms-playwright"},
+            cwd="/opt/playwright-mcp",
+        ),
+        enable_tools=PLAYWRIGHT_TOOLS,
+        execution_timeout=60,
+    )
+
+
+@asynccontextmanager
+async def sandbox_browser_agent_session(
+    *,
+    headless: bool = True,
+    model: ChatModelBase | None = None,
+    bypass_permissions: bool = False,
+) -> AsyncIterator[Agent]:
+    """Run Playwright MCP and Chromium in an ephemeral Docker sandbox."""
+    if not headless:
+        raise ValueError("Docker Sandbox 仅支持无界面浏览器，请不要使用 --headed")
+
+    from agentscope.workspace import DockerWorkspace
+
+    workspace = DockerWorkspace(
+        base_image=SANDBOX_IMAGE,
+        host_workdir=None,
+        env={"PLAYWRIGHT_BROWSERS_PATH": "/ms-playwright"},
+        default_mcps=[_sandbox_playwright_mcp()],
+        skill_paths=[str(SKILL_DIR)],
+    )
+    try:
+        await workspace.initialize()
+        clients = await workspace.list_mcps(
+            agent_id="BrowserAgent",
+            session_id="browser-session",
+        )
+        if len(clients) != 1:
+            raise RuntimeError("Docker Sandbox 内的 Playwright MCP 启动失败")
+        skills = await workspace.list_skills(agent_id="BrowserAgent")
+        yield build_browser_agent(
+            clients[0],
+            model=model,
+            bypass_permissions=bypass_permissions,
+            skills_or_loaders=skills,
+        )
+    finally:
+        await workspace.close()
 
 
 class BrowserSmokeModel(ChatModelBase):
@@ -205,9 +272,10 @@ class BrowserSmokeModel(ChatModelBase):
         return ChatResponse(content=content, is_last=True)
 
 
-async def run_smoke_test() -> None:
+async def run_smoke_test(*, sandbox: bool = False) -> None:
     """Run a no-API-key end-to-end test against example.com."""
-    async with browser_agent_session(
+    session = sandbox_browser_agent_session if sandbox else browser_agent_session
+    async with session(
         model=BrowserSmokeModel(),
         bypass_permissions=True,
     ) as agent:
@@ -238,15 +306,19 @@ async def run_smoke_test() -> None:
         if not expected.issubset(called):
             raise RuntimeError(f"缺少预期工具调用：{sorted(expected - called)}")
         if failed:
+            details = "; ".join(
+                f"{block.name}: {block.output}" for block in failed
+            )
             raise RuntimeError(
-                "工具调用失败：" + ", ".join(block.name for block in failed),
+                "工具调用失败：" + details,
             )
         print("BROWSER_AGENT_SMOKE_OK")
         print("tools=" + ",".join(sorted(expected)))
 
 
-async def run_console(*, headless: bool) -> None:
-    async with browser_agent_session(headless=headless) as agent:
+async def run_console(*, headless: bool, sandbox: bool = False) -> None:
+    session = sandbox_browser_agent_session if sandbox else browser_agent_session
+    async with session(headless=headless) as agent:
         await launch_console(
             agent,
             user_name="user",
@@ -259,15 +331,20 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="AgentScope Playwright MCP Browser Agent")
     parser.add_argument("--headed", action="store_true", help="显示 Edge 浏览器窗口")
     parser.add_argument("--smoke", action="store_true", help="运行无需 API Key 的端到端测试")
+    parser.add_argument(
+        "--sandbox",
+        action="store_true",
+        help="在临时 Docker 容器中运行 Playwright MCP 和 Chromium",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     if args.smoke:
-        asyncio.run(run_smoke_test())
+        asyncio.run(run_smoke_test(sandbox=args.sandbox))
     else:
-        asyncio.run(run_console(headless=not args.headed))
+        asyncio.run(run_console(headless=not args.headed, sandbox=args.sandbox))
 
 
 if __name__ == "__main__":

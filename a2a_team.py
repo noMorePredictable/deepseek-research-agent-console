@@ -41,6 +41,7 @@ from browser_agent import (
     MCP_TOOL_PREFIX,
     BrowserSmokeModel,
     browser_agent_session,
+    sandbox_browser_agent_session,
 )
 from research_agent import build_console_agent
 
@@ -252,6 +253,7 @@ async def run_team(
     headless: bool,
     smoke: bool,
     allow_browser_actions: bool,
+    sandbox: bool,
 ) -> None:
     """启动 BrowserAgent A2A 服务，并运行 ResearchAgent 协调端。"""
     if not smoke and not allow_browser_actions:
@@ -261,7 +263,8 @@ async def run_team(
         )
 
     browser_model = BrowserSmokeModel() if smoke else None
-    async with browser_agent_session(
+    session = sandbox_browser_agent_session if sandbox else browser_agent_session
+    async with session(
         headless=headless,
         model=browser_model,
         bypass_permissions=smoke or allow_browser_actions,
@@ -344,6 +347,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="允许远程 BrowserAgent 执行项目限定的 Playwright 工具",
     )
+    parser.add_argument(
+        "--sandbox",
+        action="store_true",
+        help="让 BrowserAgent 的 Playwright MCP 在临时 Docker 容器中运行",
+    )
     return parser.parse_args()
 
 
@@ -354,6 +362,7 @@ def main() -> None:
             headless=not args.headed,
             smoke=args.smoke,
             allow_browser_actions=args.allow_browser_actions,
+            sandbox=args.sandbox,
         ),
     )
 
