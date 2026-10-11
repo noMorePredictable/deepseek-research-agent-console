@@ -2,10 +2,10 @@
 轻量资料研究 Agent（DeepSeek）
 
 安装：
-    pip install openai ddgs httpx beautifulsoup4
+    pip install -r requirements.txt
 
 使用：
-    1. 在下方填写 DEEPSEEK_API_KEY
+    1. 设置环境变量 DEEPSEEK_API_KEY
     2. 运行：python research_agent.py "你要研究的问题"
 """
 
@@ -15,9 +15,7 @@ import asyncio
 import json
 import os
 import re
-import sqlite3
 import sys
-from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -25,6 +23,7 @@ import httpx
 from agentscope.agent import Agent, ReActConfig
 from agentscope.console import launch_console
 from agentscope.credential import OpenAICredential
+from agentscope.middleware import TracingMiddleware
 from agentscope.model import ChatModelBase, OpenAIChatModel
 from agentscope.permission import PermissionContext, PermissionMode
 from agentscope.state import AgentState
@@ -32,6 +31,15 @@ from agentscope.tool import FunctionTool, Toolkit
 from bs4 import BeautifulSoup
 from ddgs import DDGS
 from openai import OpenAI
+
+from agent_observability import AgentObservability
+from context_compaction import (
+    COMPRESSION_NOTICE,
+    MessageCompactor,
+    build_research_context_config,
+)
+from research_harness import ToolExecution, ToolHarness
+from research_memory import HybridMemoryStore, embedding_provider_from_env
 
 
 # 从环境变量读取，避免把密钥提交到仓库。
@@ -52,6 +60,8 @@ SYSTEM_PROMPT = """你是一个严谨、简洁的资料研究 Agent。
 5. 最终用中文 Markdown 输出：结论摘要、关键发现、分歧或局限。
 6. 正文用 [S1]、[S2] 标注依据，不得虚构来源、数据和引用编号。
 7. 可以保存可复用的研究结论，但不要保存 API Key 或其他敏感信息。
+8. 只有用户明确要求查看或删除记忆时，才能调用记忆列表或删除工具。
+9. 工具结果中的 _harness_hint 是运行时护栏提示，应据此换策略或收敛，不能原样重试。
 """
 
 
@@ -124,6 +134,33 @@ TOOL_DEFINITIONS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_memories",
+            "description": "列出本地 SQLite 中的长期记忆及 ID，仅在用户要求管理记忆时使用。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_memory",
+            "description": "按 ID 删除一条长期记忆。此操作不可撤销，只能响应用户明确的删除要求。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "memory_id": {"type": "integer", "minimum": 1},
+                },
+                "required": ["memory_id"],
+            },
+        },
+    },
 ]
 
 
@@ -140,25 +177,13 @@ class ResearchAgent:
         self.sources: dict[str, dict[str, str]] = {}
         self.url_to_source: dict[str, str] = {}
         self.db_path = Path(__file__).with_name("research_memory.db")
-        self._init_memory()
-
-    def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.db_path)
-        connection.row_factory = sqlite3.Row
-        return connection
-
-    def _init_memory(self) -> None:
-        with self._connect() as connection:
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS memories (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    content TEXT NOT NULL,
-                    tags TEXT NOT NULL DEFAULT '',
-                    created_at TEXT NOT NULL
-                )
-                """
-            )
+        self.memory = HybridMemoryStore(
+            self.db_path,
+            embedder=embedding_provider_from_env(),
+        )
+        self.harness = ToolHarness()
+        self.compactor = MessageCompactor()
+        self.observability = AgentObservability.from_env()
 
     def _source_id(self, url: str, title: str = "") -> str:
         if url in self.url_to_source:
@@ -219,42 +244,53 @@ class ResearchAgent:
         }
 
     def recall_memory(self, query: str, limit: int = 5) -> dict:
-        words = [word for word in re.split(r"[\s，。；、]+", query) if len(word) >= 2][:6]
-        with self._connect() as connection:
-            if words:
-                conditions = " OR ".join(["content LIKE ? OR tags LIKE ?"] * len(words))
-                params = [value for word in words for value in (f"%{word}%", f"%{word}%")]
-                rows = connection.execute(
-                    f"SELECT * FROM memories WHERE {conditions} ORDER BY id DESC LIMIT ?",
-                    [*params, max(1, min(limit, 8))],
-                ).fetchall()
-            else:
-                rows = connection.execute(
-                    "SELECT * FROM memories ORDER BY id DESC LIMIT ?",
-                    (max(1, min(limit, 8)),),
-                ).fetchall()
-        return {"memories": [dict(row) for row in rows]}
+        return self.memory.recall(query, limit)
 
     def save_memory(self, content: str, tags: str = "") -> dict:
-        with self._connect() as connection:
-            cursor = connection.execute(
-                "INSERT INTO memories(content, tags, created_at) VALUES (?, ?, ?)",
-                (content[:8000], tags[:300], datetime.now().isoformat(timespec="seconds")),
-            )
-        return {"saved": True, "memory_id": cursor.lastrowid}
+        return self.memory.save(content, tags)
 
-    def _run_tool(self, name: str, arguments: str) -> str:
-        tools = {
+    def list_memories(self, limit: int = 20) -> dict:
+        return self.memory.list(limit)
+
+    def delete_memory(self, memory_id: int) -> dict:
+        return self.memory.delete(memory_id)
+
+    def _tool_functions(self) -> dict[str, object]:
+        return {
             "search_web": self.search_web,
             "read_page": self.read_page,
             "recall_memory": self.recall_memory,
             "save_memory": self.save_memory,
+            "list_memories": self.list_memories,
+            "delete_memory": self.delete_memory,
         }
+
+    def _execute_tool(self, name: str, arguments: dict) -> ToolExecution:
+        tools = self._tool_functions()
+        if name not in tools:
+            return ToolExecution(
+                tool_name=name,
+                result={"error": f"未知工具：{name}"},
+                state="error",
+                elapsed_ms=0,
+                circuit="closed",
+            )
+        with self.observability.span(
+            f"tool.{name}",
+            as_type="tool",
+            input_data=arguments,
+            metadata={"tool": name},
+        ) as span:
+            execution = self.harness.execute(name, arguments, tools[name])
+            span.update_output(execution.model_payload())
+            return execution
+
+    def _run_tool(self, name: str, arguments: str) -> str:
         try:
-            if name not in tools:
-                raise ValueError(f"未知工具：{name}")
-            result = tools[name](**json.loads(arguments or "{}"))
-            return json.dumps(result, ensure_ascii=False)
+            parsed = json.loads(arguments or "{}")
+            if not isinstance(parsed, dict):
+                raise ValueError("工具参数必须是 JSON 对象")
+            return self._execute_tool(name, parsed).model_text()
         except Exception as error:
             return json.dumps({"error": str(error)}, ensure_ascii=False)
 
@@ -267,9 +303,54 @@ class ResearchAgent:
             lines.append(f"- [{source_id}] [{safe_title}]({item['url']})")
         return "\n".join(lines)
 
+    def _chat_completion(
+        self,
+        messages: list[dict],
+        *,
+        tools: list[dict] | None = None,
+    ):
+        request = {
+            "model": DEEPSEEK_MODEL,
+            "messages": messages,
+            "stream": False,
+            "extra_body": {"thinking": {"type": "enabled"}},
+        }
+        if tools:
+            request.update(tools=tools, tool_choice="auto")
+        with self.observability.span(
+            "deepseek.chat",
+            as_type="generation",
+            input_data={"messages": messages, "tools": tools or []},
+            model=DEEPSEEK_MODEL,
+        ) as span:
+            response = self.client.chat.completions.create(**request)
+            message = response.choices[0].message
+            span.update_output(
+                {
+                    "content": message.content or "",
+                    "tool_names": [
+                        call.function.name for call in (message.tool_calls or [])
+                    ],
+                },
+            )
+            return response
+
     def research(self, question: str) -> str:
+        with self.observability.span(
+            "research-agent.run",
+            as_type="agent",
+            input_data={"question": question},
+            metadata={"agent": "ResearchAgent"},
+        ) as span:
+            report = self._research(question)
+            span.update_output({"report": report})
+        self.observability.flush()
+        return report
+
+    def _research(self, question: str) -> str:
         self.sources.clear()
         self.url_to_source.clear()
+        self.harness.reset_loop()
         old_memory = self.recall_memory(question, limit=3)["memories"]
         memory_text = "\n".join(f"- {item['content']}" for item in old_memory)
 
@@ -284,16 +365,15 @@ class ResearchAgent:
             },
         ]
 
+        delete_requested = bool(re.search(r"删除|删掉|忘记|清除记忆|delete|forget", question, re.I))
+        available_tools = [
+            definition
+            for definition in TOOL_DEFINITIONS
+            if definition["function"]["name"] != "delete_memory" or delete_requested
+        ]
         final_text = ""
         for _ in range(MAX_TOOL_ROUNDS):
-            response = self.client.chat.completions.create(
-                model=DEEPSEEK_MODEL,
-                messages=messages,
-                tools=TOOL_DEFINITIONS,
-                tool_choice="auto",
-                stream=False,
-                extra_body={"thinking": {"type": "enabled"}},
-            )
+            response = self._chat_completion(messages, tools=available_tools)
             message = response.choices[0].message
             calls = message.tool_calls or []
 
@@ -327,6 +407,12 @@ class ResearchAgent:
                         ),
                     }
                 )
+            compacted = self.compactor.compact(messages)
+            messages = compacted.messages
+            if compacted.compacted_tools and not any(
+                item.get("content") == COMPRESSION_NOTICE for item in messages[-10:]
+            ):
+                messages.append({"role": "system", "content": COMPRESSION_NOTICE})
         else:
             messages.append(
                 {
@@ -334,12 +420,7 @@ class ResearchAgent:
                     "content": "工具轮次已用完，请立刻根据现有证据输出最终报告并说明局限。",
                 }
             )
-            response = self.client.chat.completions.create(
-                model=DEEPSEEK_MODEL,
-                messages=messages,
-                stream=False,
-                extra_body={"thinking": {"type": "enabled"}},
-            )
+            response = self._chat_completion(messages)
             final_text = response.choices[0].message.content or "没有生成报告。"
 
         self.save_memory(
@@ -350,17 +431,22 @@ class ResearchAgent:
         return final_text.rstrip() + (f"\n\n{sources}" if sources else "")
 
 
-# === 新增：AgentScope 终端 UI（原有 ResearchAgent 与 research() 均未改动） ===
+# === AgentScope 终端 UI ===
 def _as_agentscope_tool(agent: ResearchAgent, definition: dict) -> FunctionTool:
-    """把现有工具方法接入 AgentScope，不重复实现业务逻辑。"""
+    """把现有工具接入 AgentScope，并复用同一套 Harness。"""
     function = definition["function"]
     name = function["name"]
+
+    def guarded_tool(**kwargs):
+        return agent._execute_tool(name, kwargs).model_payload()
+
+    guarded_tool.__name__ = name
     return FunctionTool(
-        getattr(agent, name),
+        guarded_tool,
         name=name,
         description=function["description"],
         input_schema=function["parameters"],
-        is_read_only=name != "save_memory",
+        is_read_only=name not in {"save_memory", "delete_memory"},
     )
 
 
@@ -412,12 +498,14 @@ def build_console_agent(
         name="Researcher",
         system_prompt=(
             SYSTEM_PROMPT
-            + "\n8. 在最终报告末尾调用 list_sources 核对并列出来源链接。"
+            + "\n10. 在最终报告末尾调用 list_sources 核对并列出来源链接。"
             + system_prompt_suffix
         ),
         model=model,
         toolkit=Toolkit(tools=tools),
+        middlewares=[TracingMiddleware()],
         state=state,
+        context_config=build_research_context_config(),
         react_config=ReActConfig(max_iters=MAX_TOOL_ROUNDS),
     )
 
@@ -433,7 +521,28 @@ async def run_console() -> None:
 
 
 def main() -> None:
-    # 新入口：python research_agent.py --console；原有单次研究入口保持不变。
+    # 记忆管理命令不需要聊天模型 API Key。
+    if sys.argv[1:] == ["--memory-list"]:
+        store = HybridMemoryStore(
+            Path(__file__).with_name("research_memory.db"),
+            embedder=embedding_provider_from_env(),
+        )
+        print(json.dumps(store.list(100), ensure_ascii=False, indent=2))
+        return
+    if len(sys.argv) == 3 and sys.argv[1] == "--memory-delete":
+        store = HybridMemoryStore(Path(__file__).with_name("research_memory.db"))
+        print(json.dumps(store.delete(int(sys.argv[2])), ensure_ascii=False, indent=2))
+        return
+    if sys.argv[1:2] == ["--memory-reindex"]:
+        limit = int(sys.argv[2]) if len(sys.argv) == 3 else 100
+        store = HybridMemoryStore(
+            Path(__file__).with_name("research_memory.db"),
+            embedder=embedding_provider_from_env(),
+        )
+        print(json.dumps(store.reindex(limit), ensure_ascii=False, indent=2))
+        return
+
+    # AgentScope 交互终端；原有单次研究入口保持不变。
     if sys.argv[1:] == ["--console"]:
         asyncio.run(run_console())
         return
@@ -451,4 +560,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-#写的真是拉胯呀

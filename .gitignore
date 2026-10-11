@@ -1,8 +1,10 @@
 __pycache__/
 *.py[cod]
 .venv/
+.uv-cache/
 .env
 node_modules/
 .playwright-mcp/
 research_memory.db
 research_report.md
+tests/tmp*/

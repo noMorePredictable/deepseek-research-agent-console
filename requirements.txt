@@ -3,4 +3,5 @@ agentscope[a2a,workspace-docker]==2.0.8
 beautifulsoup4>=4.12,<5
 ddgs>=9,<10
 httpx>=0.27,<1
+langfuse>=4,<5
 openai>=1.0,<4
